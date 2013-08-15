@@ -27,14 +27,19 @@
  ******************************************************************************/
 package com.salesforce.phoenix.index;
 
+import java.io.IOException;
 import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 
 import org.apache.hadoop.hbase.KeyValue;
+import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.coprocessor.RegionCoprocessorEnvironment;
+import org.apache.hadoop.hbase.regionserver.ExposedMemStore;
+import org.apache.hadoop.hbase.util.Bytes;
 
 import com.salesforce.hbase.index.builder.covered.ColumnReference;
 import com.salesforce.hbase.index.builder.covered.TableState;
@@ -47,11 +52,15 @@ public class LocalTableState implements TableState {
   private long ts;
   private RegionCoprocessorEnvironment env;
   private Map<String, byte[]> attributes;
+  private ExposedMemStore memstore;
+  private LocalTable table;
+  private Mutation update;
 
-  public LocalTableState(RegionCoprocessorEnvironment environment, Result currentState,
-      Map<String, byte[]> updateAttributes) {
+  public LocalTableState(RegionCoprocessorEnvironment environment, LocalTable table, Mutation update) {
     this.env = environment;
-    this.attributes = updateAttributes;
+    this.attributes = update.getAttributesMap();
+    this.table = table;
+    this.update = update;
   }
 
   public void addUpdate(Collection<KeyValue> kvs) {
@@ -74,7 +83,7 @@ public class LocalTableState implements TableState {
   }
 
   @Override
-  public Iterator<KeyValue> getTableState(List<ColumnReference> columns) {
+  public Iterator<KeyValue> getTableState(List<ColumnReference> columns) throws IOException {
     ensureLocalStateInitialized();
     // TODO Implement TableState.getTableState
     return null;
@@ -86,10 +95,16 @@ public class LocalTableState implements TableState {
    * Even then, there is still fairly low contention as each new Put/Delete will have its own table
    * state.
    */
-  private synchronized void ensureLocalStateInitialized(){
+  private synchronized void ensureLocalStateInitialized() throws IOException {
     // TODO implement LocalTableState#ensureLocalStateInitialized
-    //check the local store - is it initialized?
-      // not initialized, but maybe the current row is in the row cache?
+    // check the local memstore - is it initialized?
+    if (this.memstore == null) {
+      this.memstore = new ExposedMemStore(this.env.getConfiguration(), KeyValue.COMPARATOR);
+      // get the current state of the row
+      this.memstore.upsert(this.table.getCurrentRowState(update).list());
+      
+    }
+
         // not in the row cache, so get it from the local table
   }
 

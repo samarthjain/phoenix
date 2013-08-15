@@ -1,5 +1,6 @@
 package com.salesforce.hbase.index.builder.covered;
 
+import java.io.IOException;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -33,7 +34,7 @@ public interface TableState {
   public void setCurrentTimestamp(long timestamp);
 
   // use this to get the cf:cq as of the current timestamp
-  public Iterator<KeyValue> getTableState(List<ColumnReference> columns);
+  public Iterator<KeyValue> getTableState(List<ColumnReference> columns) throws IOException;
 
   /**
    * @return the attributes attached to the current update (e.g. {@link Mutation}).

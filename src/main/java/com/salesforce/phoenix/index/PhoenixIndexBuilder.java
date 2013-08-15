@@ -51,9 +51,12 @@ import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.Pair;
 
+import com.google.common.collect.Ordering;
 import com.google.common.collect.TreeMultimap;
+import com.salesforce.hbase.index.builder.BaseIndexBuilder;
 import com.salesforce.hbase.index.builder.covered.CoveredColumnIndexer;
 import com.salesforce.hbase.index.builder.covered.IndexCodec;
+import com.salesforce.hbase.index.builder.covered.TableState;
 
 /**
  * Build covered indexes for phoenix updates.
@@ -68,17 +71,22 @@ import com.salesforce.hbase.index.builder.covered.IndexCodec;
  * NOTE: This implementation doesn't cleanup the index when we remove a key-value on compaction or
  * flush, leading to a bloated index that needs to be cleaned up by a background process.
  */
-public class PhoenixIndexBuilder extends BaseCoveredColumnIndexer {
+public class PhoenixIndexBuilder extends BaseIndexBuilder {
 
   private static final Log LOG = LogFactory.getLog(PhoenixIndexBuilder.class);
   private static final String CODEC_INSTANCE_KEY = "com.salesforce.hbase.index.codec.class";
 
-  private Map<byte[], Result> currentRowCache = new TreeMap<byte[], Result>(Bytes.BYTES_COMPARATOR);
   private IndexCodec codec;
+  private Map<byte[], Result> rowCache = new TreeMap<byte[], Result>(Bytes.BYTES_COMPARATOR);
+  private RegionCoprocessorEnvironment env;
+
+  // TODO actually get this from the CP endpoint
+  private final BatchCache batchCache = new BatchCache();
+  private LocalTable localTable;
 
   @Override
   public void setup(RegionCoprocessorEnvironment env) throws IOException {
-    super.setup(env);
+    this.env = env;
     // setup the phoenix codec. Generally, this will just be in standard one, but abstracting here
     // so we can use it later when generalizing covered indexes
     Configuration conf = env.getConfiguration();
@@ -91,12 +99,13 @@ public class PhoenixIndexBuilder extends BaseCoveredColumnIndexer {
     } catch (Exception e) {
       throw new IOException(e);
     }
+    
+    this.localTable = new LocalTable(env, rowCache, batchCache);
   }
 
   @Override
   public Collection<Pair<Mutation, String>> getIndexUpdate(Put p) throws IOException {
-    Result currentRow = getCurrentRowState(p);
-    return getIndexUpdateForMutationWithCurrentRow(p, currentRow);
+    return getIndexUpdateForMutationWithCurrentRow(p);
   }
 
 
@@ -106,14 +115,14 @@ public class PhoenixIndexBuilder extends BaseCoveredColumnIndexer {
    * @param currentRow
    * @return
    */
-  private Collection<Pair<Mutation, String>> getIndexUpdateForMutationWithCurrentRow(Put p,
-      Result currentRow) {
+  private Collection<Pair<Mutation, String>> getIndexUpdateForMutationWithCurrentRow(Put p) {
     // TODO Implement PhoenixIndexBuilderV2.getIndexUpdateForMutationWithCurrentRow
     // build the index updates for each group
     List<Pair<Mutation, String>> updateMap = new ArrayList<Pair<Mutation, String>>();
 
     // create a state manager, so we can manage each batch
-    LocalTableState tableState = new LocalTableState(env, currentRow, p.getAttributesMap());
+    LocalTableState tableState =
+ new LocalTableState(env, localTable, p);
 
     batchMutationAndAddUpdates(updateMap, tableState, p);
 
@@ -148,6 +157,34 @@ public class PhoenixIndexBuilder extends BaseCoveredColumnIndexer {
        */
       addMutationsForBatch(updateMap, batch, state);
     }
+  }
+
+  /**
+   * Batch all the {@link KeyValue}s in a {@link Mutation} by timestamp. Updates any
+   * {@link KeyValue} with a timestamp == {@link HConstants#LATEST_TIMESTAMP} to a single value
+   * obtained when the method is called.
+   * @param m {@link Mutation} from which to extract the {@link KeyValue}s
+   * @return map of timestamp to all the keyvalues with the same timestamp. the implict tree sorting
+   *         in the returned ensures that batches (when iterating through the keys) will iterate the
+   *         kvs in timestamp order
+   */
+  protected TreeMultimap<Long, KeyValue> createTimestampBatchesFromFamilyMap(Mutation m) {
+    long now = EnvironmentEdgeManager.currentTimeMillis();
+    byte[] nowBytes = Bytes.toBytes(now);
+    TreeMultimap<Long, KeyValue> batches =
+        TreeMultimap.create(Ordering.natural(), KeyValue.COMPARATOR);
+    for (List<KeyValue> kvs : m.getFamilyMap().values()) {
+      for (KeyValue kv : kvs) {
+        long ts = kv.getTimestamp();
+        // override the timestamp to the current time, so the index and primary tables match
+        // all the keys with LATEST_TIMESTAMP will then be put into the same batch
+        if (ts == HConstants.LATEST_TIMESTAMP) {
+          kv.updateLatestStamp(nowBytes);
+        }
+        batches.put(kv.getTimestamp(), kv);
+      }
+    }
+    return batches;
   }
 
   /**
@@ -211,16 +248,13 @@ public class PhoenixIndexBuilder extends BaseCoveredColumnIndexer {
 
   @Override
   public Collection<Pair<Mutation, String>> getIndexUpdate(Delete d) throws IOException {
-    // this should probably be managed by the TableState. Easier to leave here for now. -jyates
-    Result currenRow = getCurrentRowState(d);
-
     // stores all the return values
     List<Pair<Mutation, String>> updateMap = new ArrayList<Pair<Mutation, String>>();
 
     // We have to figure out which kind of delete it is, since we need to do different things if its
     // a general (row) delete, versus a delete of just a single column or family
     Map<byte[], List<KeyValue>> families = d.getFamilyMap();
-    LocalTableState state = new LocalTableState(env, currenRow, d.getAttributesMap());
+    LocalTableState state = new LocalTableState(env, localTable, d);
 
     // Option 1: its a row delete marker, so we just need to delete the most recent state for each
     // group, as of the specified timestamp in the delete
@@ -256,33 +290,11 @@ public class PhoenixIndexBuilder extends BaseCoveredColumnIndexer {
     for (int i = 0; i < miniBatchOp.size(); i++) {
       Pair<Mutation, Integer> op = miniBatchOp.getOperation(i);
       Mutation m = op.getFirst();
-      this.currentRowCache.remove(m.getRow());
+      this.rowCache.remove(m.getRow());
     }
   }
 
-  private Result getCurrentRowState(Mutation m) throws IOException {
-    // check to see if this put is the first in a batch
-    boolean matchesBatch = matchesKnownBatch(m);
-    Result currentRow = null;
-    byte[] sourceRow = m.getRow();
-    if (matchesBatch) {
-      currentRow = currentRowCache.get(sourceRow);
-    }
 
-    // we haven't seen this row before, so look it up
-    if (currentRow == null) {
-      currentRow = getCurrentRow(sourceRow);
-      if (matchesBatch) {
-        // stick it back in the cache
-        this.currentRowCache.put(sourceRow, currentRow);
-      }
-    }
-
-    if (LOG.isDebugEnabled()) {
-      LOG.debug("Updating index for row: " + Bytes.toString(sourceRow));
-    }
-    return currentRow;
-  }
 
   /**
    * Check to see if the update is a batch-based {@link Mutation}, in which case we want to use a
