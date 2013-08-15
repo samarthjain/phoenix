@@ -128,6 +128,8 @@ public class PhoenixIndexBuilder extends BaseIndexBuilder {
    * key-value in the update to see if it matches the others. Generally, this will be the case, but
    * you can add kvs to a mutation that don't all have the timestamp, so we need to manage
    * everything in batches based on timestamp.
+   * <p>
+   * Adds all the updates in the {@link Mutation} to the state, as a side-effect.
    * @param updateMap index updates into which to add new updates. Modified as a side-effect.
    * @param state current state of the row for the mutation.
    * @param m mutation to batch
@@ -179,8 +181,12 @@ public class PhoenixIndexBuilder extends BaseIndexBuilder {
   }
 
   /**
-   * @param updateMap
-   * @param batch
+   * For a single batch, get all the index updates and add them to the updateMap
+   * <p>
+   * Adds all the updates in the {@link Mutation} to the state, as a side-effect.
+   * @param updateMap map to update with new index elements
+   * @param batch timestamp-based batch of edits
+   * @param state local state to update and pass to the codec
    */
   private void addMutationsForBatch(Collection<Pair<Mutation, String>> updateMap,
       Entry<Long, Collection<KeyValue>> batch, LocalTableState state) {
@@ -278,15 +284,16 @@ public class PhoenixIndexBuilder extends BaseIndexBuilder {
       // we only need to get deletes and not add puts because this delete covers all columns
       addDeleteUpdatesToMap(updateMap, state, now);
 
-      // needed for current version of HBase that has an issue where the batch update doesn't update
-      // the deletes before calling the hook.
+      /*
+       * Update the current state for all the kvs in the delete. Generally, we would just iterate
+       * the family map, but since we go here, the family map is empty! Therefore, we need to fake a
+       * bunch of family deletes (just like hos HRegion#prepareDelete works). This is just needed
+       * for current version of HBase that has an issue where the batch update doesn't update the
+       * deletes before calling the hook.
+       */
+      byte[] deleteRow = d.getRow();
       for (byte[] family : this.env.getRegion().getTableDesc().getFamiliesKeys()) {
-        // Don't eat the timestamp
-        d.deleteFamily(family, d.getTimeStamp());
-      }
-      // update the current state for all the kvs in the delete
-      for (Entry<byte[], List<KeyValue>> entry : d.getFamilyMap().entrySet()) {
-        state.addUpdate(entry.getValue());
+        state.addUpdate(new KeyValue(deleteRow, family, null, now, KeyValue.Type.DeleteFamily));
       }
     } else {
     // Option 2: Its actually a bunch single updates, which can have different timestamps.
