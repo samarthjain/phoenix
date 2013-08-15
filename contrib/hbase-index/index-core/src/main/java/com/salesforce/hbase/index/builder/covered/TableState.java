@@ -2,8 +2,10 @@ package com.salesforce.hbase.index.builder.covered;
 
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 
 import org.apache.hadoop.hbase.KeyValue;
+import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.coprocessor.RegionCoprocessorEnvironment;
 
 /**
@@ -32,4 +34,9 @@ public interface TableState {
 
   // use this to get the cf:cq as of the current timestamp
   public Iterator<KeyValue> getTableState(List<ColumnReference> columns);
+
+  /**
+   * @return the attributes attached to the current update (e.g. {@link Mutation}).
+   */
+  public Map<String, byte[]> getUpdateAttributes();
 }

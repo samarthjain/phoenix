@@ -2,7 +2,6 @@ package com.salesforce.hbase.index.builder.covered;
 
 import java.util.Arrays;
 
-import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.util.Bytes;
 
 /**
