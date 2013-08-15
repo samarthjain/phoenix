@@ -112,4 +112,9 @@ public class LocalTableState implements TableState {
   public Map<String, byte[]> getUpdateAttributes() {
     return this.attributes;
   }
+
+  public Result getCurrentRowState() {
+    // TODO implement LocalTableState#getCurrentRowState
+    return null;
+  }
 }

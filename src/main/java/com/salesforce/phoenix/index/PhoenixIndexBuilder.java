@@ -54,6 +54,7 @@ import org.apache.hadoop.hbase.util.Pair;
 import com.google.common.collect.Ordering;
 import com.google.common.collect.TreeMultimap;
 import com.salesforce.hbase.index.builder.BaseIndexBuilder;
+import com.salesforce.hbase.index.builder.covered.CoveredColumnIndexCodec;
 import com.salesforce.hbase.index.builder.covered.CoveredColumnIndexer;
 import com.salesforce.hbase.index.builder.covered.IndexCodec;
 import com.salesforce.hbase.index.builder.covered.TableState;
@@ -105,30 +106,20 @@ public class PhoenixIndexBuilder extends BaseIndexBuilder {
 
   @Override
   public Collection<Pair<Mutation, String>> getIndexUpdate(Put p) throws IOException {
-    return getIndexUpdateForMutationWithCurrentRow(p);
-  }
-
-
-  /**
-   * Get the index updates that need to be made for the current row
-   * @param p
-   * @param currentRow
-   * @return
-   */
-  private Collection<Pair<Mutation, String>> getIndexUpdateForMutationWithCurrentRow(Put p) {
-    // TODO Implement PhoenixIndexBuilderV2.getIndexUpdateForMutationWithCurrentRow
     // build the index updates for each group
     List<Pair<Mutation, String>> updateMap = new ArrayList<Pair<Mutation, String>>();
 
     // create a state manager, so we can manage each batch
-    LocalTableState tableState =
- new LocalTableState(env, localTable, p);
+    LocalTableState state = new LocalTableState(env, localTable, p);
 
-    batchMutationAndAddUpdates(updateMap, tableState, p);
+    batchMutationAndAddUpdates(updateMap, state, p);
 
     if (LOG.isDebugEnabled()) {
       LOG.debug("Found index updates for Put: " + updateMap);
     }
+
+    // we have all the updates for this row, so we just need to update the row cache for this row
+    updateRowCache(p, state);
     return updateMap;
   }
 
@@ -223,8 +214,20 @@ public class PhoenixIndexBuilder extends BaseIndexBuilder {
         // HBase does
         String table = Bytes.toString(p.getSecond());
         updateMap.add(new Pair<Mutation, String>(p.getFirst(), table));
+
+        // TODO - fix this bit. See CoveredColumnIndexer#getIndexRow, #getNextEntries
+        // if the next newest timestamp is newer than our timestamp there are entries in the table
+        // for the index rows that affect this index entry, so we need to delete the Put, but at the
+        // newer timestamp
+        Delete d = null;
+        if (indexRow.nextNewestTs > timestamp
+            && indexRow.nextNewestTs != CoveredColumnIndexCodec.NO_NEWER_PRIMARY_TABLE_ENTRY_TIMESTAMP) {
+          d = new Delete(rowKey);
+          d.setTimestamp(indexRow.nextNewestTs);
+        }
       }
     }
+
   }
 
   /**
@@ -256,8 +259,13 @@ public class PhoenixIndexBuilder extends BaseIndexBuilder {
     Map<byte[], List<KeyValue>> families = d.getFamilyMap();
     LocalTableState state = new LocalTableState(env, localTable, d);
 
-    // Option 1: its a row delete marker, so we just need to delete the most recent state for each
-    // group, as of the specified timestamp in the delete
+    /*
+     * Option 1: its a row delete marker, so we just need to delete the most recent state for each
+     * group, as of the specified timestamp in the delete. This can happen if we have a single row
+     * update and it is part of a batch mutation (prepare doesn't happen until later... maybe a
+     * bug?). In a single delete, this delete gets all the column families appended, so the family
+     * map won't be empty by the time it gets here.
+     */
     if (families.size() == 0) {
       // get a consistent view of name
       long now = d.getTimeStamp();
@@ -267,14 +275,34 @@ public class PhoenixIndexBuilder extends BaseIndexBuilder {
         d.setTimestamp(now);
       }
       // get deletes from the codec
+      // we only need to get deletes and not add puts because this delete covers all columns
       addDeleteUpdatesToMap(updateMap, state, now);
-      return updateMap;
-    }
 
+      // needed for current version of HBase that has an issue where the batch update doesn't update
+      // the deletes before calling the hook.
+      for (byte[] family : this.env.getRegion().getTableDesc().getFamiliesKeys()) {
+        // Don't eat the timestamp
+        d.deleteFamily(family, d.getTimeStamp());
+      }
+      // update the current state for all the kvs in the delete
+      for (Entry<byte[], List<KeyValue>> entry : d.getFamilyMap().entrySet()) {
+        state.addUpdate(entry.getValue());
+      }
+    } else {
     // Option 2: Its actually a bunch single updates, which can have different timestamps.
     // Therefore, we need to do something similar to the put case and batch by timestamp
     batchMutationAndAddUpdates(updateMap, state, d);
+    }
+
+    // we have all the updates for this row, so we just need to update the row cache for this row
+    updateRowCache(d, state);
+
     return updateMap;
+  }
+
+  private void updateRowCache(Mutation m, LocalTableState state) {
+    Result r = state.getCurrentRowState();
+    this.rowCache.put(m.getRow(), r);
   }
 
   @Override
@@ -293,18 +321,4 @@ public class PhoenixIndexBuilder extends BaseIndexBuilder {
       this.rowCache.remove(m.getRow());
     }
   }
-
-
-
-  /**
-   * Check to see if the update is a batch-based {@link Mutation}, in which case we want to use a
-   * row cache to avoid N look-ups to the row.
-   * @param m mutation to check for a batch-id
-   * @return <tt>true</tt> if the mutation is a batch mutation we know about
-   */
-  private boolean matchesKnownBatch(Mutation m) {
-    // TODO Implement PhoenixIndexBuilderV2.matchesKnownBatch
-    return false;
-  }
-
 }
