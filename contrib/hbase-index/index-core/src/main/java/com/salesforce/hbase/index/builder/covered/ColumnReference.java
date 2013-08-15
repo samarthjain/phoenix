@@ -23,12 +23,20 @@ package com.salesforce.hbase.index.builder.covered;
 public class ColumnReference {
   public static byte[] ALL_QUALIFIERS = new byte[0];
 
-  String family;
+  byte[] family;
   byte[] qualifier;
 
-  public ColumnReference(String family, byte[] qualifier) {
+  public ColumnReference(byte[] family, byte[] qualifier) {
     this.family = family;
     this.qualifier = qualifier;
+  }
+
+  public byte[] getFamily() {
+    return this.family;
+  }
+
+  public byte[] getQualifier() {
+    return this.qualifier;
   }
 
 }
