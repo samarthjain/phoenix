@@ -138,6 +138,9 @@ public class PhoenixIndexBuilder extends BaseIndexBuilder {
       LocalTableState state, Mutation m) {
     // split the mutation into timestamp-based batches
     TreeMultimap<Long, KeyValue> batches = createTimestampBatchesFromFamilyMap(m);
+    // we can need more deletes if a batch is 'back in time' from the current state of the row. The
+    // deletes would then cover the current state with the next state for the row
+    boolean needMoreDeletes = false;
     // go through each batch of keyvalues and build separate index entries for each
     for (Entry<Long, Collection<KeyValue>> batch : batches.asMap().entrySet()) {
       // update the table state to expose up to the batch's newest timestamp
@@ -148,7 +151,11 @@ public class PhoenixIndexBuilder extends BaseIndexBuilder {
        * current batch) the next group will see that as the current state, which will can cause the
        * a delete and a put to be created for the next group.
        */
-      addMutationsForBatch(updateMap, batch, state);
+      needMoreDeletes = addMutationsForBatch(updateMap, batch, state);
+    }
+
+    if (needMoreDeletes) {
+      // TODO delete management
     }
   }
 
@@ -188,7 +195,7 @@ public class PhoenixIndexBuilder extends BaseIndexBuilder {
    * @param batch timestamp-based batch of edits
    * @param state local state to update and pass to the codec
    */
-  private void addMutationsForBatch(Collection<Pair<Mutation, String>> updateMap,
+  private boolean addMutationsForBatch(Collection<Pair<Mutation, String>> updateMap,
       Entry<Long, Collection<KeyValue>> batch, LocalTableState state) {
     /*
      * Generally, the current update will be the most recent thing to be added. In that case, all we
@@ -214,13 +221,22 @@ public class PhoenixIndexBuilder extends BaseIndexBuilder {
 
     // get the updates to the current index
     Iterable<Pair<Put, byte[]>> upserts = codec.getIndexUpserts(state);
+    long maxTs = 0;
     if (upserts != null) {
       for (Pair<Put, byte[]> p : upserts) {
         // TODO replace this as just storing a byte[], to avoid all the String <-> byte[] swapping
         // HBase does
         String table = Bytes.toString(p.getSecond());
-        updateMap.add(new Pair<Mutation, String>(p.getFirst(), table));
+        Put put = p.getFirst();
 
+        // find the latest timestamp in this put
+        for (List<KeyValue> kvs : put.getFamilyMap().values()) {
+          for (KeyValue kv : kvs) {
+            maxTs = maxTs < kv.getTimestamp() ? kv.getTimestamp() : maxTs;
+          }
+        }
+        updateMap.add(new Pair<Mutation, String>(p.getFirst(), table));
+        
         // TODO - fix this bit. See CoveredColumnIndexer#getIndexRow, #getNextEntries
         // if the next newest timestamp is newer than our timestamp there are entries in the table
         // for the index rows that affect this index entry, so we need to delete the Put, but at the

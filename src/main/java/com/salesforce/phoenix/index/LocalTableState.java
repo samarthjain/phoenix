@@ -105,8 +105,10 @@ public class LocalTableState implements TableState {
   @Override
   public Iterator<KeyValue> getTableState(List<ColumnReference> columns) throws IOException {
     ensureLocalStateInitialized();
-    // create a filter that matches just the given column references
     FilterList filters = new FilterList();
+    // filter out things with a newer timestamp
+    filters.addFilter(new MaxTimestampFilter(ts));
+    // create a filter that matches each column reference
     for (ColumnReference ref : columns) {
       Filter columnFilter = getColumnFilter(ref);
       filters.addFilter(columnFilter);
@@ -158,8 +160,8 @@ public class LocalTableState implements TableState {
     // check the local memstore - is it initialized?
     if (this.memstore == null) {
       this.memstore = new ExposedMemStore(this.env.getConfiguration(), KeyValue.COMPARATOR);
-      // get the current state of the row
-      this.memstore.upsert(this.table.getCurrentRowState(update).list());
+      // add the current state of the row
+      this.addUpdate(this.table.getCurrentRowState(update).list());
     }
   }
 
