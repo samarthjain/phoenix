@@ -38,13 +38,21 @@ import java.util.List;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.KeyValue.Type;
+import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.filter.FilterBase;
 import org.apache.hadoop.hbase.util.Bytes;
 
 /**
- * Only allow the 'latest' timestamp of each family:qualifier pair - handles delete keyvalues. This
- * is similar to some of the work the ScanQueryMatcher does to ensure correct visibility of keys
- * based on deletes.
+ * Only allow the 'latest' timestamp of each family:qualifier pair, ensuring that they aren't
+ * covered by a previous delete. This is similar to some of the work the ScanQueryMatcher does to
+ * ensure correct visibility of keys based on deletes.
+ * <p>
+ * Note there is a little bit of conceptually odd behavior (though it matches the HBase
+ * specifications) around point deletes ({@link KeyValue} of type {@link Type#Delete}. These deletes
+ * only apply to a single {@link KeyValue} at a single point in time - they essentially completely
+ * 'cover' the existing {@link Put} at that timestamp. However, they don't 'cover' any other
+ * keyvalues at older timestamps. Therefore, if there is a point-delete at ts = 5, and puts at ts =
+ * 4, and ts = 5, we will only allow the put at ts = 4.
  * <p>
  * Expects {@link KeyValue}s to arrive in sorted order, with 'Delete' {@link Type} {@link KeyValue}s
  * ({@link Type#DeleteColumn}, {@link Type#DeleteFamily}, {@link Type#Delete})) before their regular
