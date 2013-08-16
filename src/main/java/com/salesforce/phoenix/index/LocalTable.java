@@ -40,9 +40,9 @@ import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.coprocessor.RegionCoprocessorEnvironment;
 
 /**
- * Lazy wrapper around the local HTable. Uses a rowCache to minimize lookups for a given row over
- * the course of a given batch and lazy instantiation of the connection the local HTable (for cases
- * that don't even even need to access local table state).
+ * Lazy wrapper around the local HTable and a per-rowkey cache. Uses the row cache to minimize
+ * lookups for a given row over the course of a given batch and lazy instantiation of the connection
+ * the local HTable (for cases that don't even even need to access local table state).
  */
 public class LocalTable {
   private static final Log LOG = LogFactory.getLog(LocalTable.class);
