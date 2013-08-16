@@ -63,7 +63,9 @@ import org.apache.hadoop.hbase.util.Bytes;
  */
 public class ApplyAndFilterDeletesFilter extends FilterBase {
 
-  private KeyValue END_ROW_KEY = KeyValue.createKeyValueFromKey(new byte[]{127, 127, 127,  127, 127, 127, 127 });
+  static KeyValue END_ROW_KEY = KeyValue.createKeyValueFromKey(new byte[] { 127, 127, 127, 127,
+      127, 127,
+      127 });
   private boolean done = false;
   List<byte[]>families;
   private KeyValue coveringDelete;
@@ -109,7 +111,7 @@ public class ApplyAndFilterDeletesFilter extends FilterBase {
       this.done =true;
     }else{
       //there is a valid family, so we should seek to that
-      hint = KeyValue.createFirstOnRow(peeked.getKey(), nextFamily, HConstants.EMPTY_BYTE_ARRAY);
+      hint = KeyValue.createFirstOnRow(peeked.getRow(), nextFamily, HConstants.EMPTY_BYTE_ARRAY);
     }
     
     return hint;
@@ -149,9 +151,11 @@ public class ApplyAndFilterDeletesFilter extends FilterBase {
           && coveringDelete.matchingColumn(next.getFamily(), next.getQualifier())) {
         // check to see if the match applies directly to this version
         if (coveringDelete.getTimestamp() == next.getTimestamp()) {
-          // this covers this exact key. Therefore, we can skip this key AND discard the
-          // covering delete because it must only match this single version
-          coveringDelete = null;
+          /*
+           * this covers this exact key. Therefore, we can skip this key. However, we can't discard
+           * the covering delete because it might match the next put as well (in the case of having
+           * the same put twice).
+           */
           return ReturnCode.SKIP;
         }
       }
