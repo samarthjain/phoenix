@@ -109,14 +109,18 @@ public class LocalTableState implements TableState {
     // filter out things with a newer timestamp
     filters.addFilter(new MaxTimestampFilter(ts));
     // create a filter that matches each column reference
+    List<byte[]> families = new ArrayList<byte[]>(columns.size());
     for (ColumnReference ref : columns) {
       Filter columnFilter = getColumnFilter(ref);
       filters.addFilter(columnFilter);
+      families.add(ref.getFamily());
     }
+    
+    // filter out kvs based on deletes
+    filters.addFilter(new ApplyAndFilterDeletesFilter(families));
 
-    // create a scanner on those columns
+    // create a scanner and wrap it as an iterator, meaning you can only go forward
     final FilteredKeyValueScanner kvScanner = new FilteredKeyValueScanner(filters, memstore);
-    // return the scanner as an iterator
     return new Iterator<KeyValue>() {
 
       @Override
