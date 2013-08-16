@@ -47,6 +47,9 @@ import org.apache.hadoop.hbase.util.Bytes;
  * covered by a previous delete. This is similar to some of the work the ScanQueryMatcher does to
  * ensure correct visibility of keys based on deletes.
  * <p>
+ * No actual delete {@link KeyValue}s are allowed to pass through this filter - they are always
+ * skipped.
+ * <p>
  * Note there is a little bit of conceptually odd behavior (though it matches the HBase
  * specifications) around point deletes ({@link KeyValue} of type {@link Type#Delete}. These deletes
  * only apply to a single {@link KeyValue} at a single point in time - they essentially completely
@@ -58,13 +61,13 @@ import org.apache.hadoop.hbase.util.Bytes;
  * ({@link Type#DeleteColumn}, {@link Type#DeleteFamily}, {@link Type#Delete})) before their regular
  * {@link Type#Put} counterparts.
  */
-public class LatestValueOnlyFilter extends FilterBase {
+public class ApplyAndFilterDeletesFilter extends FilterBase {
 
   private KeyValue END_ROW_KEY = KeyValue.createKeyValueFromKey(new byte[]{127, 127, 127,  127, 127, 127, 127 });
   private boolean done = false;
   List<byte[]>families;
   private KeyValue coveringDelete;
-  public LatestValueOnlyFilter(Collection<byte[]> families){
+  public ApplyAndFilterDeletesFilter(Collection<byte[]> families){
     this.families = new ArrayList<byte[]>(families);
     Collections.sort(this.families, Bytes.BYTES_COMPARATOR);
   }
@@ -118,20 +121,18 @@ public class LatestValueOnlyFilter extends FilterBase {
     if(this.done){
       return ReturnCode.SKIP;
     }
-  /*
-   * check for a delete to see if we can just replace this with a single delete; if its a
-   * family delete, then we have deleted all columns and are definitely done with this
-   * family. This works because deletes will always sort first, so we can be sure that
-   * if we see a delete, we can skip everything else.
-   */
-  if (next.isDeleteFamily()) {
-      return ReturnCode.SEEK_NEXT_USING_HINT;
-  }
-  // its not a family delete and it matches a target column and is <= the target timestamp
+
     switch (KeyValue.Type.codeToType(next.getType())) {
-    case DeleteColumn:
+    /*
+     * check for a delete to see if we can just replace this with a single delete; if its a family
+     * delete, then we have deleted all columns and are definitely done with this family. This works
+     * because deletes will always sort first, so we can be sure that if we see a delete, we can
+     * skip everything else.
+     */
+    case DeleteFamily:
       // if its the delete of the entire column, then there are no more possible columns it
-      // could be and we are done.
+      // could be and we move onto the next column
+    case DeleteColumn:
       return ReturnCode.SEEK_NEXT_USING_HINT;
     case Delete:
       // we are just deleting the single column value at this point.
