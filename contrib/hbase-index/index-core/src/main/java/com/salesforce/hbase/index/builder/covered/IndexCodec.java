@@ -33,14 +33,17 @@ public interface IndexCodec {
   /**
    * Get the index updates for the primary table state, for each index table. The returned
    * {@link Put}s need to be fully specified (including timestamp) to minimize passes over the same
-   * key-values multiple times. Generally, you should specify the same timestamps on the Put as
-   * {@link TableState#getCurrentTimestamp()} so the index entries match the primary table row.
+   * key-values multiple times.
+   * <p>
+   * You must specify the same timestamps on the Put as {@link TableState#getCurrentTimestamp()} so
+   * the index entries match the primary table row. This could be managed at a higher level, but
+   * would require iterating all the kvs in the Put again - very inefficient when compared to the
+   * current interface where you must provide a timestamp anyways (so you might as well provide the
+   * right one).
    * @param state the current state of the table that needs to an index update Generally, you only
    *          care about the latest column values, for each column you are indexing for each index
    *          table.
    * @return the pairs of (updates,index table name) that should be applied.
    */
-  public Iterable<Pair<Put, byte[]>> getIndexUpserts(TableState state);
-  // JY: after this, internally checks the current TS vs the put TS and push a delete if we need to
-  // (see coveredColumnCodec)
+  public Iterable<IndexUpdate> getIndexUpserts(TableState state);
 }

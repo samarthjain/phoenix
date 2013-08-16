@@ -17,10 +17,12 @@
  */
 package com.salesforce.hbase.index.builder.covered;
 
+import org.apache.hadoop.hbase.util.Bytes;
+
 /**
  * 
  */
-public class ColumnReference {
+public class ColumnReference implements Comparable<ColumnReference> {
   public static byte[] ALL_QUALIFIERS = new byte[0];
 
   byte[] family;
@@ -39,4 +41,29 @@ public class ColumnReference {
     return this.qualifier;
   }
 
+  @Override
+  public int compareTo(ColumnReference o) {
+    int c = Bytes.compareTo(family, o.family);
+    if (c == 0) {
+      // matching families, compare qualifiers
+      c = Bytes.compareTo(qualifier, o.qualifier);
+    }
+    return c;
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (o instanceof ColumnReference) {
+      ColumnReference other = (ColumnReference) o;
+      if (Bytes.equals(family, other.family)) {
+        return Bytes.equals(qualifier, other.qualifier);
+      }
+    }
+    return false;
+  }
+
+  @Override
+  public int hashCode() {
+    return Bytes.hashCode(family) + Bytes.hashCode(qualifier);
+  }
 }

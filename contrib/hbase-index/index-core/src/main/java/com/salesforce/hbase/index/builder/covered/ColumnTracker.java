@@ -25,34 +25,72 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE 
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  ******************************************************************************/
-package com.salesforce.phoenix.index;
+package com.salesforce.hbase.index.builder.covered;
 
-import java.util.Map;
+import java.util.Collections;
+import java.util.List;
 
-import org.apache.hadoop.hbase.client.Delete;
-import org.apache.hadoop.hbase.util.Pair;
-
-import com.salesforce.hbase.index.builder.covered.IndexCodec;
-import com.salesforce.hbase.index.builder.covered.IndexUpdate;
-import com.salesforce.hbase.index.builder.covered.TableState;
 
 /**
- * Phoenix-basec {@link IndexCodec}. Manages all the logic of how to cleanup an index (
- * {@link #getIndexDeletes(Map, TableState)}) as well as what the new index state should be (
- * {@link #getIndexUpserts(Map, TableState)}).
+ * Simple POJO for tracking a bunch of column references and the next-newest timestamp for those
+ * columns
+ * <p>
+ * Two {@link ColumnTracker}s are considered equal if they track the same columns, even if their
+ * timestamps are different.
  */
-public class PhoenixIndexCodec implements IndexCodec {
+public class ColumnTracker {
 
-  @Override
-  public Iterable<Pair<Delete, byte[]>> getIndexDeletes(TableState state) {
-    // TODO Implement IndexCodec.getIndexDeletes
-    return null;
+  public static final long NO_NEWER_PRIMARY_TABLE_ENTRY_TIMESTAMP = Long.MAX_VALUE;
+  private final List<ColumnReference> columns;
+  private long ts = NO_NEWER_PRIMARY_TABLE_ENTRY_TIMESTAMP;
+
+  public ColumnTracker(List<ColumnReference> columns) {
+    this.columns = columns;
+    // sort the columns
+    Collections.sort(columns);
+  }
+
+  /**
+   * Set the current timestamp, only if the passed timestamp is strictly less than the currently
+   * stored timestamp
+   * @param ts the timestmap to potentially store.
+   * @return the currently stored timestamp.
+   */
+  public long setTs(long ts) {
+    this.ts = this.ts > ts ? ts : this.ts;
+    return this.ts;
+  }
+
+  public long getTS() {
+    return this.ts;
   }
 
   @Override
-  public Iterable<IndexUpdate> getIndexUpserts(TableState state) {
-    // TODO Implement IndexCodec.getIndexUpserts
-    return null;
+  public int hashCode() {
+    int hash = 0;
+    for (ColumnReference ref : columns) {
+      hash += ref.hashCode();
+    }
+    return hash;
   }
 
+  @Override
+  public boolean equals(Object o){
+    if(!(o instanceof ColumnTracker)){
+      return false;
+    }
+    ColumnTracker other = (ColumnTracker)o;
+    if (other.columns.size() != columns.size()) {
+      return false;
+    }
+
+    // check each column to see if they match
+    for (int i = 0; i < columns.size(); i++) {
+      if (!columns.get(i).equals(other.columns.get(i))) {
+        return false;
+      }
+    }
+
+    return true;
+  }
 }

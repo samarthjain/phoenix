@@ -30,9 +30,11 @@ package com.salesforce.phoenix.index;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.client.Mutation;
@@ -47,8 +49,10 @@ import org.apache.hadoop.hbase.filter.QualifierFilter;
 import org.apache.hadoop.hbase.regionserver.ExposedMemStore;
 import org.apache.hadoop.hbase.regionserver.KeyValueScanner;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.Pair;
 
 import com.salesforce.hbase.index.builder.covered.ColumnReference;
+import com.salesforce.hbase.index.builder.covered.ColumnTracker;
 import com.salesforce.hbase.index.builder.covered.TableState;
 import com.salesforce.hbase.index.builder.covered.util.FilteredKeyValueScanner;
 
@@ -67,6 +71,7 @@ public class LocalTableState implements TableState {
   private ExposedMemStore memstore;
   private LocalTable table;
   private Mutation update;
+  private Set<ColumnTracker> trackedColumns = new HashSet<ColumnTracker>();
 
   public LocalTableState(RegionCoprocessorEnvironment environment, LocalTable table, Mutation update) {
     this.env = environment;
@@ -102,8 +107,45 @@ public class LocalTableState implements TableState {
     this.ts = timestamp;
   }
 
+  public void resetTrackedColumns() {
+    this.trackedColumns.clear();
+  }
+
   @Override
-  public Iterator<KeyValue> getTableState(List<ColumnReference> columns) throws IOException {
+  public Pair<Iterator<KeyValue>, ColumnTracker> getIndexedColumnsTableState(
+      List<ColumnReference> indexedColumns) throws IOException {
+    ensureLocalStateInitialized();
+    FilterList filters = new FilterList();
+
+    // create a filter that matches each column reference
+    List<byte[]> families = new ArrayList<byte[]>(indexedColumns.size());
+    for (ColumnReference ref : indexedColumns) {
+      Filter columnFilter = getColumnFilter(ref);
+      filters.addFilter(columnFilter);
+      families.add(ref.getFamily());
+    }
+    // filter out things with a newer timestamp and track the column references to which it applies
+    ColumnTracker tracker = new ColumnTracker(indexedColumns);
+    synchronized (this.trackedColumns) {
+      // we haven't seen this set of columns before, so we need to create a new tracker
+      if (!this.trackedColumns.contains(tracker)) {
+        this.trackedColumns.add(tracker);
+      }
+    }
+
+    // skip to the right TS. This needs to come before the deletes since the deletes will hide any
+    // state that comes before the actual kvs, so we need to capture those TS as they change the row
+    // state.
+    filters.addFilter(new ColumnTrackingNextLargestTimestampFilter(ts, tracker));
+
+    // filter out kvs based on deletes
+    filters.addFilter(new ApplyAndFilterDeletesFilter(families));
+
+    return new Pair<Iterator<KeyValue>, ColumnTracker>(getFilteredIterator(filters), tracker);
+  }
+
+  @Override
+  public Iterator<KeyValue> getNonIndexedColumnsTableState(List<ColumnReference> columns) throws IOException {
     ensureLocalStateInitialized();
     FilterList filters = new FilterList();
     // filter out things with a newer timestamp
@@ -119,6 +161,10 @@ public class LocalTableState implements TableState {
     // filter out kvs based on deletes
     filters.addFilter(new ApplyAndFilterDeletesFilter(families));
 
+    return getFilteredIterator(filters);
+  }
+
+  private Iterator<KeyValue> getFilteredIterator(Filter filters) {
     // create a scanner and wrap it as an iterator, meaning you can only go forward
     final FilteredKeyValueScanner kvScanner = new FilteredKeyValueScanner(filters, memstore);
     return new Iterator<KeyValue>() {
@@ -156,7 +202,7 @@ public class LocalTableState implements TableState {
 
   /**
    * Initialize the managed local state. Generally, this will only be called by
-   * {@link #getTableState(List)}, which is unlikely to be called concurrently from the outside.
+   * {@link #getNonIndexedColumnsTableState(List)}, which is unlikely to be called concurrently from the outside.
    * Even then, there is still fairly low contention as each new Put/Delete will have its own table
    * state.
    */

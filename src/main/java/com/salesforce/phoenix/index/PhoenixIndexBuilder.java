@@ -54,9 +54,10 @@ import org.apache.hadoop.hbase.util.Pair;
 import com.google.common.collect.Ordering;
 import com.google.common.collect.TreeMultimap;
 import com.salesforce.hbase.index.builder.BaseIndexBuilder;
-import com.salesforce.hbase.index.builder.covered.CoveredColumnIndexCodec;
+import com.salesforce.hbase.index.builder.covered.ColumnTracker;
 import com.salesforce.hbase.index.builder.covered.CoveredColumnIndexer;
 import com.salesforce.hbase.index.builder.covered.IndexCodec;
+import com.salesforce.hbase.index.builder.covered.IndexUpdate;
 import com.salesforce.hbase.index.builder.covered.TableState;
 
 /**
@@ -138,9 +139,20 @@ public class PhoenixIndexBuilder extends BaseIndexBuilder {
       LocalTableState state, Mutation m) {
     // split the mutation into timestamp-based batches
     TreeMultimap<Long, KeyValue> batches = createTimestampBatchesFromFamilyMap(m);
-    // we can need more deletes if a batch is 'back in time' from the current state of the row. The
-    // deletes would then cover the current state with the next state for the row
-    boolean needMoreDeletes = false;
+
+    // figure out the newest timestamp in the current row's state. We need to keep this around so we
+    // can correctly do cleanups in the index for 'back in time' puts. This is a bit heavyweight
+    // right now as we iterate all the current KVs once, just for this and then do a likely
+    // iteration for each row. This also invalidates all the lazy lookup work in LocalTable, but
+    // keeping it around for when we figure out a better interface for this.
+    long newestTs = 0;
+    for (KeyValue kv : state.getCurrentRowState().list()) {
+      long ts = kv.getTimestamp();
+      if (ts > newestTs) {
+        newestTs = ts;
+      }
+    }
+
     // go through each batch of keyvalues and build separate index entries for each
     for (Entry<Long, Collection<KeyValue>> batch : batches.asMap().entrySet()) {
       // update the table state to expose up to the batch's newest timestamp
@@ -151,18 +163,14 @@ public class PhoenixIndexBuilder extends BaseIndexBuilder {
        * current batch) the next group will see that as the current state, which will can cause the
        * a delete and a put to be created for the next group.
        */
-      needMoreDeletes = addMutationsForBatch(updateMap, batch, state);
-    }
-
-    if (needMoreDeletes) {
-      // TODO delete management
+      addMutationsForBatch(updateMap, batch, state, newestTs);
     }
   }
 
   /**
    * Batch all the {@link KeyValue}s in a {@link Mutation} by timestamp. Updates any
-   * {@link KeyValue} with a timestamp == {@link HConstants#LATEST_TIMESTAMP} to a single value
-   * obtained when the method is called.
+   * {@link KeyValue} with a timestamp == {@link HConstants#LATEST_TIMESTAMP} to the timestamp at
+   * the time the method is called.
    * @param m {@link Mutation} from which to extract the {@link KeyValue}s
    * @return map of timestamp to all the keyvalues with the same timestamp. the implict tree sorting
    *         in the returned ensures that batches (when iterating through the keys) will iterate the
@@ -173,15 +181,17 @@ public class PhoenixIndexBuilder extends BaseIndexBuilder {
     byte[] nowBytes = Bytes.toBytes(now);
     TreeMultimap<Long, KeyValue> batches =
         TreeMultimap.create(Ordering.natural(), KeyValue.COMPARATOR);
+
+    // batch kvs by timestamp
     for (List<KeyValue> kvs : m.getFamilyMap().values()) {
       for (KeyValue kv : kvs) {
         long ts = kv.getTimestamp();
         // override the timestamp to the current time, so the index and primary tables match
         // all the keys with LATEST_TIMESTAMP will then be put into the same batch
-        if (ts == HConstants.LATEST_TIMESTAMP) {
-          kv.updateLatestStamp(nowBytes);
+        if (kv.updateLatestStamp(nowBytes)) {
+          ts = now;
         }
-        batches.put(kv.getTimestamp(), kv);
+        batches.put(ts, kv);
       }
     }
     return batches;
@@ -195,21 +205,22 @@ public class PhoenixIndexBuilder extends BaseIndexBuilder {
    * @param batch timestamp-based batch of edits
    * @param state local state to update and pass to the codec
    */
-  private boolean addMutationsForBatch(Collection<Pair<Mutation, String>> updateMap,
-      Entry<Long, Collection<KeyValue>> batch, LocalTableState state) {
+  private void addMutationsForBatch(Collection<Pair<Mutation, String>> updateMap,
+      Entry<Long, Collection<KeyValue>> batch, LocalTableState state, long newestTs) {
     /*
      * Generally, the current update will be the most recent thing to be added. In that case, all we
      * need to is issue a delete for the previous index row (the state of the row, without the
      * update applied) at the current timestamp. This gets rid of anything currently in the index
-     * for the current state of the row (at the timestamp).
-     *
-     * If things arrive out of order (we are using custom timestamps) we should still see the index
-     * in the correct order (assuming we scan after the out-of-order update in finished). Therefore,
-     * we when we aren't the most recent update to the index, we need to delete the state at the
-     * current timestamp (similar to above), but also issue a delete for the added for at the next
-     * newest timestamp of any of the columns in the update; we need to cleanup the insert so it
-     * looks like it was also deleted at that newer timestamp. see the most recent update in the
-     * index, even if we are making a put back in time (out of order).
+     * for the current state of the row (at the timestamp). Then we can just follow that by applying
+     * the pending update and building the index update based on the new row state.
+     */
+    /*
+     * If things arrive out of order (client is using custom timestamps) we should still see the
+     * index in the correct order (assuming we scan after the out-of-order update in finished).
+     * Therefore, we when we aren't the most recent update to the index, we need to delete the state
+     * at the current timestamp (similar to above), but also issue a delete for the added index
+     * updates at the next newest timestamp of any of the columns in the update; we need to cleanup
+     * the insert so it looks like it was also deleted at that next newest timestamp.
      */
 
     // start by getting the cleanup for the current state of the
@@ -220,36 +231,33 @@ public class PhoenixIndexBuilder extends BaseIndexBuilder {
     state.addUpdate(batch.getValue());
 
     // get the updates to the current index
-    Iterable<Pair<Put, byte[]>> upserts = codec.getIndexUpserts(state);
-    long maxTs = 0;
+    Iterable<IndexUpdate> upserts = codec.getIndexUpserts(state);
+    state.resetTrackedColumns();
     if (upserts != null) {
-      for (Pair<Put, byte[]> p : upserts) {
+      for (IndexUpdate p : upserts) {
         // TODO replace this as just storing a byte[], to avoid all the String <-> byte[] swapping
         // HBase does
-        String table = Bytes.toString(p.getSecond());
-        Put put = p.getFirst();
+        String table = Bytes.toString(p.getTableName());
+        Put put = p.getUpdate();
 
-        // find the latest timestamp in this put
-        for (List<KeyValue> kvs : put.getFamilyMap().values()) {
-          for (KeyValue kv : kvs) {
-            maxTs = maxTs < kv.getTimestamp() ? kv.getTimestamp() : maxTs;
+        // create a column tracker for this update to see if we know about it
+        ColumnTracker tracker = p.getIndexedColumns();
+        if (tracker != null) {
+          // we have a latest ts for the tracker, so we need to potentially issue a delete for the
+          // put as well
+          long trackerTs = tracker.getTS();
+          if (trackerTs != ColumnTracker.NO_NEWER_PRIMARY_TABLE_ENTRY_TIMESTAMP
+              && put.getTimeStamp() < trackerTs) {
+            // there is a TS for the interested columns that is greater than the columns in the put.
+            // Therefore, we need to issue a delete at the same timestamp
+            Delete d = new Delete(put.getRow());
+            d.setTimestamp(trackerTs);
+            updateMap.add(new Pair<Mutation, String>(put, table));
           }
         }
-        updateMap.add(new Pair<Mutation, String>(p.getFirst(), table));
-        
-        // TODO - fix this bit. See CoveredColumnIndexer#getIndexRow, #getNextEntries
-        // if the next newest timestamp is newer than our timestamp there are entries in the table
-        // for the index rows that affect this index entry, so we need to delete the Put, but at the
-        // newer timestamp
-        Delete d = null;
-        if (indexRow.nextNewestTs > timestamp
-            && indexRow.nextNewestTs != CoveredColumnIndexCodec.NO_NEWER_PRIMARY_TABLE_ENTRY_TIMESTAMP) {
-          d = new Delete(rowKey);
-          d.setTimestamp(indexRow.nextNewestTs);
-        }
+        updateMap.add(new Pair<Mutation, String>(put, table));
       }
     }
-
   }
 
   /**
