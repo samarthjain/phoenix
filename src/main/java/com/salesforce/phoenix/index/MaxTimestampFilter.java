@@ -33,10 +33,10 @@ import java.io.IOException;
 
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.filter.FilterBase;
-import org.apache.hadoop.hbase.filter.Filter.ReturnCode;
+import org.apache.hadoop.hbase.util.Bytes;
 
 /**
- * Exclusive filter on the maximum timestamp allowed. Excludes all elements greater than (but not
+ * Inclusive filter on the maximum timestamp allowed. Excludes all elements greater than (but not
  * equal to) the given timestamp, so given ts = 5, a {@link KeyValue} with ts 6 is excluded, but not
  * one with ts = 5.
  */
@@ -49,9 +49,24 @@ public class MaxTimestampFilter extends FilterBase {
   }
 
   @Override
+  public KeyValue getNextKeyHint(KeyValue currentKV) {
+    // this might be a little excessive right now - better safe than sorry though, so we don't mess
+    // with other filters too much.
+    KeyValue kv = currentKV.deepCopy();
+    int offset =kv.getTimestampOffset();
+    //set the timestamp in the buffer
+    byte[] buffer = kv.getBuffer();
+    byte[] ts = Bytes.toBytes(this.ts);
+    System.arraycopy(ts, 0, buffer, offset, ts.length);
+
+    return kv;
+  }
+
+  @Override
   public ReturnCode filterKeyValue(KeyValue v) {
-    if (v.getTimestamp() >= ts) {
-      return ReturnCode.SKIP;
+    long timestamp = v.getTimestamp();
+    if (timestamp > ts) {
+      return ReturnCode.SEEK_NEXT_USING_HINT;
     }
     return ReturnCode.INCLUDE;
   }
