@@ -39,22 +39,22 @@ import com.salesforce.phoenix.cache.TenantCache;
 
 /**
  * 
- * Server-side implementation of {@link HashCacheProtocol}
+ * Server-side implementation of {@link ServerCachingProtocol}
  *
  * @author jtaylor
  * @since 0.1
  */
-public class HashCacheImplementation extends BaseEndpointCoprocessor implements HashCacheProtocol {
+public class HashCacheImplementation extends BaseEndpointCoprocessor implements ServerCachingProtocol {
 
     @Override
-    public boolean addHashCache(byte[] tenantId, byte[] joinId, ImmutableBytesWritable hashCache) throws SQLException {
+    public boolean addServerCache(byte[] tenantId, byte[] joinId, ImmutableBytesWritable hashCache) throws SQLException {
         TenantCache tenantCache = GlobalCache.getTenantCache(this.getEnvironment().getConfiguration(), new ImmutableBytesWritable(tenantId));
         tenantCache.addHashCache(new ImmutableBytesWritable(joinId), hashCache);
         return true;
     }
 
     @Override
-    public boolean removeHashCache(byte[] tenantId, byte[] joinId) throws SQLException {
+    public boolean removeServerCache(byte[] tenantId, byte[] joinId) throws SQLException {
         TenantCache tenantCache = GlobalCache.getTenantCache(this.getEnvironment().getConfiguration(), new ImmutableBytesWritable(tenantId));
         tenantCache.removeHashCache(new ImmutableBytesWritable(joinId));
         return true;

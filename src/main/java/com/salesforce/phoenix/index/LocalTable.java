@@ -30,13 +30,7 @@ package com.salesforce.phoenix.index;
 import java.io.IOException;
 import java.util.Map;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
-import org.apache.hadoop.hbase.client.HTableInterface;
-import org.apache.hadoop.hbase.client.Mutation;
-import org.apache.hadoop.hbase.client.Result;
-import org.apache.hadoop.hbase.client.ResultScanner;
-import org.apache.hadoop.hbase.client.Scan;
+import org.apache.hadoop.hbase.client.*;
 import org.apache.hadoop.hbase.coprocessor.RegionCoprocessorEnvironment;
 
 /**
@@ -45,7 +39,6 @@ import org.apache.hadoop.hbase.coprocessor.RegionCoprocessorEnvironment;
  * the local HTable (for cases that don't even even need to access local table state).
  */
 public class LocalTable {
-  private static final Log LOG = LogFactory.getLog(LocalTable.class);
 
   private volatile HTableInterface localTable;
   private RegionCoprocessorEnvironment env;

@@ -56,18 +56,18 @@ import com.salesforce.phoenix.util.*;
 
 /**
  * 
- * Client for adding cache of one side of a join to region servers
+ * Client for sending cache to each region server
  *306
  * @author jtaylor
  * @since 0.1
  */
-public class HashCacheClient {
+public class ServerCacheClient {
+    // TODO: move to join specific place
     public static final int DEFAULT_HASH_CACHE_SIZE = 1024*1024*20;  // 20 Mb
     private static final int DEFAULT_THREAD_TIMEOUT_MS = 60000; // 1min
     private static final int DEFAULT_MAX_HASH_CACHE_SIZE = 1024*1024*100;  // 100 Mb
     
-    private static final Log LOG = LogFactory.getLog(HashCacheClient.class);
-    private static final String JOIN_KEY_PREFIX = "joinKey";
+    private static final Log LOG = LogFactory.getLog(ServerCacheClient.class);
     private final TableRef iterateOverTableName;
     private final byte[] tenantId;
     private final ConnectionQueryServices services;
@@ -79,26 +79,26 @@ public class HashCacheClient {
      * @param iterateOverTableName table name
      * @param tenantId the tenantId or null if not applicable
      */
-    public HashCacheClient(ConnectionQueryServices services, TableRef iterateOverTableName, byte[] tenantId) {
+    public ServerCacheClient(ConnectionQueryServices services, TableRef iterateOverTableName, byte[] tenantId) {
         this.services = services;
         this.iterateOverTableName = iterateOverTableName;
         this.tenantId = tenantId;
     }
 
     /**
-     * Client-side representation of a hash cache.  Call {@link #close()} when scan doing join
+     * Client-side representation of a server cache.  Call {@link #close()} when usage
      * is complete to free cache up on region server
      *
      * @author jtaylor
      * @since 0.1
      */
-    public class HashCache implements SQLCloseable {
+    public class ServerCache implements SQLCloseable {
         private final int size;
-        private final byte[] joinId;
+        private final byte[] id;
         private final ImmutableSet<ServerName> servers;
         
-        public HashCache(byte[] joinId, Set<ServerName> servers, int size) {
-            this.joinId = joinId;
+        public ServerCache(byte[] id, Set<ServerName> servers, int size) {
+            this.id = id;
             this.servers = ImmutableSet.copyOf(servers);
             this.size = size;
         }
@@ -113,8 +113,8 @@ public class HashCacheClient {
         /**
          * Gets the unique identifier for this hash cache
          */
-        public byte[] getJoinId() {
-            return joinId;
+        public byte[] getId() {
+            return id;
         }
 
         /**
@@ -122,55 +122,45 @@ public class HashCacheClient {
          */
         @Override
         public void close() throws SQLException {
-            removeHashCache(joinId, servers);
+            removeServerCache(id, servers);
         }
 
     }
     
-    /**
-     * Send the results of scanning the hashCacheTable (using the hashCacheScan) to all
-     * region servers for the table being iterated over (i.e. the other table involved in
-     * the join that is not being hashed).
-     * @param scanner scanner for the table or intermediate results being cached
-     * @param tableName table name being scanned or null when hash cache will not be used
-     * in an outer join. TODO: switch to List<byte[]> for multi-table case if we go with
-     * single column layout
-     * @param cfs column families for table being scanned or null when hash cache will not
-     * be used in an outer join.  TODO: switch to List<byte[][]> for multi-table case if
-     * we go with single column layout
-     * @return client-side {@link HashCache} representing the added hash cache
-     * @throws SQLException 
-     * @throws MaxHashCacheSizeExceededException if size of hash cache exceeds max allowed
-     * size
-     */
-    public HashCache addHashCache(Scanner scanner, List<Expression> onExpressions, byte[] tableName, byte[][] cfs) throws SQLException {
-        final byte[] joinId = nextJoinId();
-        
+    public ServerCache addServerCache(ImmutableBytesWritable ptr) throws SQLException {
+        MemoryChunk chunk = services.getMemoryManager().allocate(ptr.getLength());
+        return sendServerCache(ptr, chunk);
+    }
+    
+    // TODO: move this code to something specific to hash joins
+    private MemoryChunk buildHashCache(ImmutableBytesWritable ptr, Scanner scanner, List<Expression> onExpressions, byte[] tableName, byte[][] cfs) throws SQLException {
         /**
-         * Serialize and compress hashCacheTable
+         * Serialize the results of the scanner and point ptr at it.
          */
-        HashCache hashCacheSpec = null;
-        SQLException firstException = null;
         ResultIterator iterator = null;
-        ImmutableBytesWritable hashCache = null;
-        List<Closeable> closeables = new ArrayList<Closeable>();
         MemoryChunk chunk = services.getMemoryManager().allocate(scanner.getEstimatedSize());
-        closeables.add(chunk);
         try {
             iterator = scanner.iterator();        
-            hashCache = serialize(iterator, onExpressions, tableName, cfs, chunk);
+            serialize(ptr, iterator, onExpressions, tableName, cfs, chunk);
         } finally {
             if (iterator != null) {
                 iterator.close();
             }
         }
-        
+        return chunk;
+    }
+    
+    private ServerCache sendServerCache(final ImmutableBytesWritable theHashCache, MemoryChunk chunk) throws SQLException {
+        List<Closeable> closeables = new ArrayList<Closeable>();
+        closeables.add(chunk);
+        ServerCache hashCacheSpec = null;
+        SQLException firstException = null;
+        final byte[] joinId = nextId();
         /**
          * Execute EndPoint in parallel on each server to send compressed hash cache 
          */
         // TODO: generalize and package as a per region server EndPoint caller
         // (ideally this would be functionality provided by the coprocessor framework)
-        final ImmutableBytesWritable theHashCache = hashCache;
         boolean success = false;
         ExecutorService executor = services.getExecutor();
         List<Future<Boolean>> futures = Collections.emptyList();
@@ -191,8 +181,8 @@ public class HashCacheClient {
                         
                         @Override
                         public Boolean call() throws Exception {
-                            HashCacheProtocol protocol = iterateOverTable.coprocessorProxy(HashCacheProtocol.class, key);
-                            return protocol.addHashCache(tenantId, joinId, theHashCache);
+                            ServerCachingProtocol protocol = iterateOverTable.coprocessorProxy(ServerCachingProtocol.class, key);
+                            return protocol.addServerCache(tenantId, joinId, theHashCache);
                         }
 
                         /**
@@ -202,13 +192,13 @@ public class HashCacheClient {
                          */
                         @Override
                         public Object getJobId() {
-                            return HashCacheClient.this;
+                            return ServerCacheClient.this;
                         }
                     }));
                 }
             }
             
-            hashCacheSpec = new HashCache(joinId,servers,theHashCache.getSize());
+            hashCacheSpec = new ServerCache(joinId,servers,theHashCache.getSize());
             // Execute in parallel
             int timeoutMs = services.getProps().getInt(QueryServices.THREAD_TIMEOUT_MS_ATTRIB, DEFAULT_THREAD_TIMEOUT_MS);
             for (Future<Boolean> future : futures) {
@@ -221,25 +211,53 @@ public class HashCacheClient {
         } catch (Exception e) {
             firstException = new SQLException(e);
         } finally {
-            if (!success) {
-                SQLCloseables.closeAllQuietly(Collections.singletonList(hashCacheSpec));
-                for (Future<Boolean> future : futures) {
-                    future.cancel(true);
-                }
-            }
             try {
-                Closeables.closeAll(closeables);
-            } catch (IOException e) {
-                if (firstException == null) {
-                    firstException = new SQLException(e);
+                if (!success) {
+                    SQLCloseables.closeAllQuietly(Collections.singletonList(hashCacheSpec));
+                    for (Future<Boolean> future : futures) {
+                        future.cancel(true);
+                    }
                 }
             } finally {
-                if (firstException != null) {
-                    throw firstException;
+                try {
+                    Closeables.closeAll(closeables);
+                } catch (IOException e) {
+                    if (firstException == null) {
+                        firstException = new SQLException(e);
+                    }
+                } finally {
+                    if (firstException != null) {
+                        throw firstException;
+                    }
                 }
             }
         }
         return hashCacheSpec;
+    }
+    
+    /**
+     * Send the results of scanning the hashCacheTable (using the hashCacheScan) to all
+     * region servers for the table being iterated over (i.e. the other table involved in
+     * the join that is not being hashed).
+     * @param scanner scanner for the table or intermediate results being cached
+     * @param tableName table name being scanned or null when hash cache will not be used
+     * in an outer join. TODO: switch to List<byte[]> for multi-table case if we go with
+     * single column layout
+     * @param cfs column families for table being scanned or null when hash cache will not
+     * be used in an outer join.  TODO: switch to List<byte[][]> for multi-table case if
+     * we go with single column layout
+     * @return client-side {@link ServerCache} representing the added hash cache
+     * @throws SQLException 
+     * @throws MaxHashCacheSizeExceededException if size of hash cache exceeds max allowed
+     * size
+     */
+    public ServerCache addHashCache(Scanner scanner, List<Expression> onExpressions, byte[] tableName, byte[][] cfs) throws SQLException {
+        /**
+         * Serialize and compress hashCacheTable
+         */
+        final ImmutableBytesWritable theHashCache = new ImmutableBytesWritable();
+        MemoryChunk chunk = buildHashCache(theHashCache, scanner, onExpressions, tableName, cfs);
+        return sendServerCache(theHashCache, chunk);
     }
 
     /**
@@ -249,7 +267,7 @@ public class HashCacheClient {
      * @throws SQLException
      * @throws IllegalStateException if hashed table cannot be removed on any region server on which it was added
      */
-    private void removeHashCache(byte[] joinId, Set<ServerName> servers) throws SQLException {
+    private void removeServerCache(byte[] joinId, Set<ServerName> servers) throws SQLException {
         Throwable lastThrowable = null;
         HTableInterface iterateOverTable = services.getTable(iterateOverTableName.getTableName());
         NavigableMap<HRegionInfo, ServerName> locations = services.getAllTableRegions(iterateOverTableName);
@@ -258,8 +276,8 @@ public class HashCacheClient {
             if (remainingOnServers.contains(entry.getValue())) {  // Call once per server
                 try {
                     byte[] key = entry.getKey().getStartKey();
-                    HashCacheProtocol protocol = iterateOverTable.coprocessorProxy(HashCacheProtocol.class, key);
-                    protocol.removeHashCache(tenantId, joinId);
+                    ServerCachingProtocol protocol = iterateOverTable.coprocessorProxy(ServerCachingProtocol.class, key);
+                    protocol.removeServerCache(tenantId, joinId);
                     remainingOnServers.remove(entry.getValue());
                 } catch (Throwable t) {
                     lastThrowable = t;
@@ -273,14 +291,14 @@ public class HashCacheClient {
     }
 
     /**
-     * Create a join ID to keep the cached information across other joins independent.
+     * Create an ID to keep the cached information across other operations independent
      */
-    private static synchronized byte[] nextJoinId() {
-        return Bytes.toBytes(JOIN_KEY_PREFIX + UUID.randomUUID().toString());
+    private static byte[] nextId() {
+        return Bytes.toBytes(UUID.randomUUID().toString());
     }
  
     // package private for testing
-    ImmutableBytesWritable serialize(ResultIterator scanner, List<Expression> onExpressions, byte[] tableName, byte[][] cfs, MemoryChunk chunk) throws SQLException {
+    void serialize(ImmutableBytesWritable ptr, ResultIterator scanner, List<Expression> onExpressions, byte[] tableName, byte[][] cfs, MemoryChunk chunk) throws SQLException {
         try {
             long maxSize = services.getProps().getLong(QueryServices.MAX_HASH_CACHE_SIZE_ATTRIB, DEFAULT_MAX_HASH_CACHE_SIZE);
             long estimatedSize = Math.min(chunk.getSize(), maxSize);
@@ -332,7 +350,7 @@ public class HashCacheClient {
                 int compressedSize = Snappy.compress(baOut.getBuffer(), 0, baOut.size(), compressed, 0);
                 // Last realloc to size of compressed buffer.
                 chunk.resize(compressedSize);
-                return new ImmutableBytesWritable(compressed,0,compressedSize);
+                ptr.set(compressed,0,compressedSize);
             } finally {
                 dataOut.close();
             }
